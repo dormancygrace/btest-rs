@@ -151,23 +151,31 @@ async fn handle_client(
     // Secondary connections send the session token in bytes 0-1 of their "command":
     //   [TOKEN_HI, TOKEN_LO, 0x02, 0x00, ...]
     // They do NOT do auth — just send them AUTH_OK with the token and they join.
-    {
+    let received_token = ((cmd_buf[0] as u16) << 8) | (cmd_buf[1] as u16);
+    let can_join = {
+        let map = sessions.lock().await;
+        cmd_buf[0] > CMD_PROTO_TCP && map.get(&received_token).is_some_and(|session| {
+            session.peer_ip == peer.ip()
+                && session.streams.len() + 1 < session.expected as usize
+        })
+    };
+    if can_join {
+        tracing::info!(
+            "Client {} is secondary TCP connection (token={:04x})",
+            peer, received_token,
+        );
+
+        // Do not hold the global session-map lock across socket I/O. A slow
+        // secondary connection must not stall unrelated clients.
+        let ok = [0x01, cmd_buf[0], cmd_buf[1], 0x00];
+        stream.write_all(&ok).await?;
+        stream.flush().await?;
+
         let mut map = sessions.lock().await;
-        let received_token = ((cmd_buf[0] as u16) << 8) | (cmd_buf[1] as u16);
         if let Some(session) = map.get_mut(&received_token) {
             if session.peer_ip == peer.ip()
-                && session.streams.len() < session.expected as usize
+                && session.streams.len() + 1 < session.expected as usize
             {
-                tracing::info!(
-                    "Client {} is secondary TCP connection (token={:04x})",
-                    peer, received_token,
-                );
-
-                // No auth for secondary connections — just send OK with token
-                let ok = [0x01, cmd_buf[0], cmd_buf[1], 0x00];
-                stream.write_all(&ok).await?;
-                stream.flush().await?;
-
                 session.streams.push(stream);
                 tracing::info!(
                     "Secondary connection joined ({}/{})",
@@ -177,7 +185,9 @@ async fn handle_client(
                 return Ok(());
             }
         }
-        drop(map);
+        return Err(BtestError::Protocol(
+            "TCP multi-connection session expired while joining".into(),
+        ));
     }
 
     // Primary connection: parse the command normally
@@ -204,8 +214,24 @@ async fn handle_client(
 
     // Build auth OK response - include session token for TCP multi-connection
     let is_tcp_multi = !cmd.is_udp() && cmd.tcp_conn_count > 0;
+    // Reserve a unique token before sending AUTH_OK. This closes the race where
+    // a fast secondary connection arrived before the primary session was added,
+    // and prevents concurrent tests from accidentally reusing a token.
     let session_token: u16 = if is_tcp_multi {
-        rand::random::<u16>() | 0x0101 // ensure both bytes non-zero
+        let mut map = sessions.lock().await;
+        let token = loop {
+            // A high byte > 1 cannot be confused with a normal TCP/UDP command.
+            let candidate = rand::random::<u16>() | 0x0201;
+            if !map.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        map.insert(token, TcpSession {
+            peer_ip: peer.ip(),
+            streams: Vec::new(),
+            expected: cmd.tcp_conn_count,
+        });
+        token
     } else {
         0
     };
@@ -223,58 +249,27 @@ async fn handle_client(
         );
     }
 
-    // Check if this is a secondary connection joining an existing TCP session
-    if is_tcp_multi {
-        let mut map = sessions.lock().await;
-        for (_token, session) in map.iter_mut() {
-            if session.peer_ip == peer.ip()
-                && session.streams.len() < session.expected as usize
-            {
-                tracing::info!(
-                    "Client {} joining TCP session ({}/{})",
-                    peer,
-                    session.streams.len() + 1,
-                    session.expected,
-                );
-                drop(map);
-                // Secondary connections also do auth with the same session token response
-                auth::server_authenticate(
-                    &mut stream,
-                    auth_user.as_deref(),
-                    auth_pass.as_deref(),
-                    &ok_response,
-                )
-                .await?;
-                let mut map = sessions.lock().await;
-                for (_t, s) in map.iter_mut() {
-                    if s.peer_ip == peer.ip() && s.streams.len() < s.expected as usize {
-                        s.streams.push(stream);
-                        return Ok(());
-                    }
-                }
-                return Ok(());
-            }
-        }
-        drop(map);
-    }
-
     // Primary connection auth
-    if let Some(ref creds) = ecsrp5_creds {
-        // EC-SRP5 authentication
-        let auth_resp: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
-        stream.write_all(&auth_resp).await?;
-        stream.flush().await?;
+    let auth_result = if let Some(ref creds) = ecsrp5_creds {
+        async {
+            // EC-SRP5 authentication
+            let auth_resp: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
+            stream.write_all(&auth_resp).await?;
+            stream.flush().await?;
 
-        crate::ecsrp5::server_authenticate(
-            &mut stream,
-            auth_user.as_deref().unwrap_or("admin"),
-            creds,
-        )
-        .await?;
+            crate::ecsrp5::server_authenticate(
+                &mut stream,
+                auth_user.as_deref().unwrap_or("admin"),
+                creds,
+            )
+            .await?;
 
-        // Send auth OK (with session token if multi-conn)
-        stream.write_all(&ok_response).await?;
-        stream.flush().await?;
+            // Send auth OK (with session token if multi-conn)
+            stream.write_all(&ok_response).await?;
+            stream.flush().await?;
+            Ok(())
+        }
+        .await
     } else {
         // MD5 or no auth
         auth::server_authenticate(
@@ -283,7 +278,13 @@ async fn handle_client(
             auth_pass.as_deref(),
             &ok_response,
         )
-        .await?;
+        .await
+    };
+    if let Err(error) = auth_result {
+        if is_tcp_multi {
+            sessions.lock().await.remove(&session_token);
+        }
+        return Err(error);
     }
 
     // Log auth success and test start
@@ -297,16 +298,6 @@ async fn handle_client(
         run_udp_test_server(&mut stream, peer, &cmd, udp_port_offset).await
     } else if is_tcp_multi {
         let conn_count = cmd.tcp_conn_count;
-
-        // Register session for secondary connections to find
-        {
-            let mut map = sessions.lock().await;
-            map.insert(session_token, TcpSession {
-                peer_ip: peer.ip(),
-                streams: Vec::new(),
-                expected: conn_count,
-            });
-        }
 
         // Wait for secondary connections
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -705,7 +696,8 @@ pub async fn run_udp_test(
     state: Arc<BandwidthState>,
     udp_port_start: u16,
 ) -> Result<(u64, u64, u64, u32)> {
-    run_udp_test_inner(stream, peer, cmd, state, udp_port_start).await
+    let udp = bind_udp_socket(stream.local_addr()?.ip(), udp_port_start)?;
+    run_udp_test_inner(stream, peer, cmd, state, udp_port_start, udp).await
 }
 
 async fn run_udp_test_server(
@@ -714,9 +706,62 @@ async fn run_udp_test_server(
     cmd: &Command,
     udp_port_offset: Arc<std::sync::atomic::AtomicU16>,
 ) -> Result<(u64, u64, u64, u32)> {
-    let offset = udp_port_offset.fetch_add(1, Ordering::SeqCst);
+    let first_offset = udp_port_offset.fetch_add(1, Ordering::SeqCst) % BTEST_UDP_PORT_COUNT;
     let state = BandwidthState::new();
-    run_udp_test_inner(stream, peer, cmd, state, BTEST_UDP_PORT_START + offset).await
+    let local_ip = stream.local_addr()?.ip();
+
+    // Reuse a bounded UDP pool. Completed sessions release their socket, while
+    // concurrent sessions skip ports that are still busy.
+    for attempt in 0..BTEST_UDP_PORT_COUNT {
+        let offset = (first_offset + attempt) % BTEST_UDP_PORT_COUNT;
+        let server_udp_port = BTEST_UDP_PORT_START + offset;
+        match bind_udp_socket(local_ip, server_udp_port) {
+            Ok(udp) => {
+                return run_udp_test_inner(
+                    stream,
+                    peer,
+                    cmd,
+                    state,
+                    server_udp_port,
+                    udp,
+                ).await;
+            }
+            Err(BtestError::Io(error)) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(BtestError::Protocol(format!(
+        "No free UDP ports in {}-{}",
+        BTEST_UDP_PORT_START,
+        BTEST_UDP_PORT_START + BTEST_UDP_PORT_COUNT - 1,
+    )))
+}
+
+fn bind_udp_socket(local_ip: std::net::IpAddr, server_udp_port: u16) -> Result<UdpSocket> {
+    let bind_addr = SocketAddr::new(local_ip, server_udp_port);
+    let domain = if local_ip.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let sock2 = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    sock2.set_nonblocking(true)?;
+    let _ = sock2.set_send_buffer_size(4 * 1024 * 1024);
+    let _ = sock2.set_recv_buffer_size(4 * 1024 * 1024);
+    if local_ip.is_ipv6() {
+        let _ = sock2.set_only_v6(true);
+    }
+    sock2.bind(&bind_addr.into())?;
+    tracing::debug!(
+        "UDP socket {}: sndbuf={}, rcvbuf={}",
+        bind_addr,
+        sock2.send_buffer_size().unwrap_or(0),
+        sock2.recv_buffer_size().unwrap_or(0),
+    );
+    Ok(UdpSocket::from_std(sock2.into())?)
 }
 
 async fn run_udp_test_inner(
@@ -725,6 +770,7 @@ async fn run_udp_test_inner(
     cmd: &Command,
     state: Arc<BandwidthState>,
     server_udp_port: u16,
+    udp: UdpSocket,
 ) -> Result<(u64, u64, u64, u32)> {
     let client_udp_port = server_udp_port + BTEST_PORT_CLIENT_OFFSET;
 
@@ -735,33 +781,6 @@ async fn run_udp_test_inner(
         "UDP test: server_port={}, client_port={}, peer={}",
         server_udp_port, client_udp_port, peer,
     );
-
-    // Bind UDP on the same address family as the peer
-    let bind_addr: SocketAddr = if peer.is_ipv6() {
-        format!("[::]:{}",  server_udp_port).parse().unwrap()
-    } else {
-        format!("0.0.0.0:{}", server_udp_port).parse().unwrap()
-    };
-    // Create socket with socket2 FIRST to set buffer sizes before tokio wraps it
-    let domain = if peer.is_ipv6() {
-        socket2::Domain::IPV6
-    } else {
-        socket2::Domain::IPV4
-    };
-    let sock2 = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-    sock2.set_nonblocking(true)?;
-    let _ = sock2.set_send_buffer_size(4 * 1024 * 1024);
-    let _ = sock2.set_recv_buffer_size(4 * 1024 * 1024);
-    if peer.is_ipv6() {
-        let _ = sock2.set_only_v6(true);
-    }
-    sock2.bind(&bind_addr.into())?;
-    tracing::debug!(
-        "UDP socket: sndbuf={}, rcvbuf={}",
-        sock2.send_buffer_size().unwrap_or(0),
-        sock2.recv_buffer_size().unwrap_or(0),
-    );
-    let udp = UdpSocket::from_std(sock2.into())?;
 
     let client_udp_addr = SocketAddr::new(peer.ip(), client_udp_port);
 
