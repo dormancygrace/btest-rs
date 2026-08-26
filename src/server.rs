@@ -404,6 +404,15 @@ async fn run_tcp_test_inner(stream: TcpStream, cmd: Command, state: Arc<Bandwidt
     let server_should_rx = cmd.server_rx();
     let tx_speed = cmd.remote_tx_speed;
 
+    if server_should_tx && server_should_rx {
+        // Status frames share the TCP byte stream with test data.  A large
+        // kernel send queue can leave a status frame behind several seconds
+        // of payload, making RouterOS display TX=0 for the whole test.
+        let sock_ref = socket2::SockRef::from(&stream);
+        let status_friendly_buffer = tx_size.saturating_mul(2).max(64 * 1024);
+        let _ = sock_ref.set_send_buffer_size(status_friendly_buffer);
+    }
+
     let (reader, writer) = stream.into_split();
 
     let mut _writer_keepalive = None;
@@ -435,6 +444,13 @@ async fn run_tcp_test_inner(stream: TcpStream, cmd: Command, state: Arc<Bandwidt
     let rx_handle = if server_should_rx {
         Some(tokio::spawn(async move {
             tcp_rx_loop(reader, state_rx).await
+        }))
+    } else if server_should_tx {
+        // Even a receive-only client sends control/status frames and eventually
+        // closes this half. Drain it so disconnects stop an unlimited TX loop
+        // promptly instead of waiting for the large send queue to fail.
+        Some(tokio::spawn(async move {
+            tcp_control_reader(reader, state_rx).await
         }))
     } else {
         _reader_keepalive = Some(reader);
@@ -495,24 +511,44 @@ async fn run_tcp_multiconn_inner(streams: Vec<TcpStream>, cmd: Command, state: A
     let mut _writer_keepalives: Vec<tokio::net::tcp::OwnedWriteHalf> = Vec::new();
     let mut _reader_keepalives: Vec<tokio::net::tcp::OwnedReadHalf> = Vec::new();
 
-    for tcp_stream in streams {
+    for (stream_index, tcp_stream) in streams.into_iter().enumerate() {
+        if server_should_tx && server_should_rx && stream_index == 0 {
+            // Only the primary stream carries session-wide status frames.
+            // Keep its kernel queue short so they reach RouterOS promptly.
+            let sock_ref = socket2::SockRef::from(&tcp_stream);
+            let status_friendly_buffer = tx_size.saturating_mul(2).max(64 * 1024);
+            let _ = sock_ref.set_send_buffer_size(status_friendly_buffer);
+        }
         let (reader, writer) = tcp_stream.into_split();
 
         if server_should_tx && server_should_rx {
             let st = state.clone();
-            tx_handles.push(tokio::spawn(async move {
-                tcp_tx_with_status(writer, tx_size, tx_speed, st).await
-            }));
+            if stream_index == 0 {
+                // Status is session-wide. Sending it on all secondary streams
+                // races the shared counter and makes RouterOS observe mostly
+                // zero-byte samples.
+                tx_handles.push(tokio::spawn(async move {
+                    tcp_tx_with_status(writer, tx_size, tx_speed, st).await
+                }));
+            } else {
+                tx_handles.push(tokio::spawn(async move {
+                    tcp_tx_loop(writer, tx_size, tx_speed, st).await
+                }));
+            }
         } else if server_should_tx {
             let st = state.clone();
             tx_handles.push(tokio::spawn(async move {
                 tcp_tx_loop(writer, tx_size, tx_speed, st).await
             }));
         } else if server_should_rx {
-            let st = state.clone();
-            tx_handles.push(tokio::spawn(async move {
-                tcp_status_sender(writer, st).await
-            }));
+            if stream_index == 0 {
+                let st = state.clone();
+                tx_handles.push(tokio::spawn(async move {
+                    tcp_status_sender(writer, st).await
+                }));
+            } else {
+                _writer_keepalives.push(writer);
+            }
         } else {
             _writer_keepalives.push(writer);
         }
@@ -521,6 +557,11 @@ async fn run_tcp_multiconn_inner(streams: Vec<TcpStream>, cmd: Command, state: A
             let st = state.clone();
             rx_handles.push(tokio::spawn(async move {
                 tcp_rx_loop(reader, st).await
+            }));
+        } else if server_should_tx {
+            let st = state.clone();
+            rx_handles.push(tokio::spawn(async move {
+                tcp_control_reader(reader, st).await
             }));
         } else {
             _reader_keepalives.push(reader);
@@ -533,7 +574,17 @@ async fn run_tcp_multiconn_inner(streams: Vec<TcpStream>, cmd: Command, state: A
         rx_handles.len(),
     );
 
-    status_report_loop(&cmd, &state).await;
+    if server_should_tx && !server_should_rx {
+        status_report_loop(&cmd, &state).await;
+    } else if server_should_tx && server_should_rx {
+        tcp_tx_report_loop(&state).await;
+    } else {
+        // The primary tcp_status_sender owns and records the aggregate RX
+        // counter. Secondary streams only carry data.
+        while state.running.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
 
     state.running.store(false, Ordering::SeqCst);
     for h in tx_handles { let _ = h.await; }
@@ -572,16 +623,21 @@ async fn tcp_tx_loop_inner(
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let mut interval = bandwidth::calc_send_interval(tx_speed, tx_size as u16);
-    // Use larger writes when running unlimited to reduce syscall overhead
-    let effective_size = if interval.is_none() { tx_size.max(256 * 1024) } else { tx_size };
+    // A bidirectional stream must remain interruptible so its one-second
+    // status messages are not stuck behind megabytes of queued TCP data.
+    let effective_size = if interval.is_none() && !send_status {
+        tx_size.max(256 * 1024)
+    } else {
+        tx_size.max(1)
+    };
     let packet = vec![0u8; effective_size];
     let mut next_send = Instant::now();
     let mut next_status = Instant::now() + Duration::from_secs(1);
     let mut status_seq: u32 = 0;
 
     while state.running.load(Ordering::Relaxed) {
-        // Inject status message every ~1 second if in bidirectional mode
-        if send_status && Instant::now() >= next_status {
+        let now = Instant::now();
+        if send_status && now >= next_status {
             status_seq += 1;
             let rx_bytes = state.rx_bytes.swap(0, Ordering::Relaxed);
             let status = StatusMessage { cpu_load: crate::cpu::get(),
@@ -594,17 +650,64 @@ async fn tcp_tx_loop_inner(
             }
             state.record_interval(0, rx_bytes, 0);
             bandwidth::print_status(status_seq, "RX", rx_bytes, Duration::from_secs(1), None);
-            next_status = Instant::now() + Duration::from_secs(1);
+            next_status += Duration::from_secs(1);
+            if next_status <= Instant::now() {
+                next_status = Instant::now() + Duration::from_secs(1);
+            }
+            continue;
+        }
+
+        if let Some(_iv) = interval {
+            if next_send > now {
+                let delay = if send_status {
+                    (next_send - now).min(next_status - now)
+                } else {
+                    next_send - now
+                };
+                tokio::time::sleep(delay).await;
+                continue;
+            }
         }
 
         if !state.spend_budget(effective_size as u64) {
             break;
         }
-        if writer.write_all(&packet).await.is_err() {
-            state.running.store(false, Ordering::SeqCst);
-            break;
-        }
-        state.tx_bytes.fetch_add(effective_size as u64, Ordering::Relaxed);
+
+        // `write` is cancellation-safe. In BOTH mode, cap how long it may
+        // wait so the periodic status frame gets priority over queued data.
+        let write_result = if send_status {
+            let until_status = next_status.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(until_status, writer.write(&packet)).await {
+                Ok(result) => Some(result),
+                Err(_) => None,
+            }
+        } else {
+            // Keep unlimited one-way tests responsive to the control reader
+            // noticing a disconnect. `write` is cancellation-safe, so a short
+            // timeout does not duplicate partially-written data.
+            match tokio::time::timeout(
+                Duration::from_millis(100),
+                writer.write(&packet),
+            ).await {
+                Ok(result) => Some(result),
+                Err(_) => None,
+            }
+        };
+
+        let written = match write_result {
+            None => {
+                state.refund_budget(effective_size as u64);
+                continue;
+            }
+            Some(Ok(0)) | Some(Err(_)) => {
+                state.refund_budget(effective_size as u64);
+                state.running.store(false, Ordering::SeqCst);
+                break;
+            }
+            Some(Ok(n)) => n,
+        };
+        state.refund_budget((effective_size - written) as u64);
+        state.tx_bytes.fetch_add(written as u64, Ordering::Relaxed);
 
         if state.tx_speed_changed.load(Ordering::Relaxed) {
             state.tx_speed_changed.store(false, Ordering::Relaxed);
@@ -627,6 +730,22 @@ async fn tcp_tx_loop_inner(
     }
 }
 
+/// In bidirectional TCP mode the writer task owns RX status reporting. This
+/// companion loop only prints TX and must not swap or record the RX counter.
+async fn tcp_tx_report_loop(state: &BandwidthState) {
+    let mut seq: u32 = 0;
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        if !state.running.load(Ordering::Relaxed) {
+            break;
+        }
+        seq += 1;
+        let tx = state.tx_bytes.swap(0, Ordering::Relaxed);
+        bandwidth::print_status(seq, "TX", tx, Duration::from_secs(1), None);
+    }
+}
+
 async fn tcp_rx_loop(mut reader: tokio::net::tcp::OwnedReadHalf, state: Arc<BandwidthState>) {
     let mut buf = vec![0u8; 256 * 1024];
     while state.running.load(Ordering::Relaxed) {
@@ -641,6 +760,22 @@ async fn tcp_rx_loop(mut reader: tokio::net::tcp::OwnedReadHalf, state: Arc<Band
                 }
                 state.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
             }
+        }
+    }
+}
+
+async fn tcp_control_reader(
+    mut reader: tokio::net::tcp::OwnedReadHalf,
+    state: Arc<BandwidthState>,
+) {
+    let mut buf = [0u8; 4096];
+    while state.running.load(Ordering::Relaxed) {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => {
+                state.running.store(false, Ordering::SeqCst);
+                break;
+            }
+            Ok(_) => {}
         }
     }
 }
@@ -811,7 +946,11 @@ async fn run_udp_test_inner(
         if use_unconnected { "unconnected" } else { "connected" },
     );
 
-    let tx_size = cmd.tx_size as usize;
+    // RouterOS' UDP size includes the IP and UDP headers. Sending the full
+    // value as payload causes fragmentation (1500 becomes a 1528-byte packet).
+    let udp_header_size = if peer.is_ipv6() { 48usize } else { 28usize };
+    let wire_size = cmd.tx_size as usize;
+    let tx_size = wire_size.saturating_sub(udp_header_size).max(4);
     let server_should_tx = cmd.server_tx();
     let server_should_rx = cmd.server_rx();
     let tx_speed = cmd.remote_tx_speed;
@@ -824,7 +963,16 @@ async fn run_udp_test_inner(
     let is_multi = use_unconnected;
     let tx_handle = if server_should_tx {
         Some(tokio::spawn(async move {
-            udp_tx_loop(&udp_tx, tx_size, tx_speed, state_tx, is_multi, tx_target).await
+            udp_tx_loop(
+                &udp_tx,
+                tx_size,
+                wire_size,
+                udp_header_size,
+                tx_speed,
+                state_tx,
+                is_multi,
+                tx_target,
+            ).await
         }))
     } else {
         None
@@ -834,7 +982,7 @@ async fn run_udp_test_inner(
     let udp_rx = udp.clone();
     let rx_handle = if server_should_rx {
         Some(tokio::spawn(async move {
-            udp_rx_loop(&udp_rx, state_rx).await
+            udp_rx_loop(&udp_rx, udp_header_size, state_rx).await
         }))
     } else {
         None
@@ -852,19 +1000,26 @@ async fn run_udp_test_inner(
 async fn udp_tx_loop(
     socket: &UdpSocket,
     tx_size: usize,
+    wire_size: usize,
+    udp_header_size: usize,
     initial_tx_speed: u32,
     state: Arc<BandwidthState>,
     multi_conn: bool,
     target: SocketAddr,
 ) {
-    let mut seq: u32 = 0;
+    let mut seq: u32 = 1;
     let mut packet = vec![0u8; tx_size];
-    let mut interval = bandwidth::calc_send_interval(initial_tx_speed, tx_size as u16);
+    // The reference implementation starts an unspecified UDP rate at 1 Mbps,
+    // then raises it from the receiver's one-second acknowledgements. Starting
+    // truly unlimited only measures how fast the kernel can enqueue packets.
+    let adaptive_speed = initial_tx_speed == 0;
+    let starting_speed = if adaptive_speed { 1_000_000 } else { initial_tx_speed };
+    let mut interval = bandwidth::calc_send_interval(starting_speed, wire_size as u16);
     let mut next_send = Instant::now();
     let mut consecutive_errors: u32 = 0;
 
     while state.running.load(Ordering::Relaxed) {
-        if !state.spend_budget(tx_size as u64) {
+        if !state.spend_budget(wire_size as u64) {
             break;
         }
 
@@ -878,7 +1033,7 @@ async fn udp_tx_loop(
         match result {
             Ok(n) => {
                 seq = seq.wrapping_add(1);
-                state.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                state.tx_bytes.fetch_add((n + udp_header_size) as u64, Ordering::Relaxed);
                 consecutive_errors = 0;
             }
             Err(e) => {
@@ -900,10 +1055,10 @@ async fn udp_tx_loop(
         }
 
         // Pick up dynamic speed changes from status loop
-        if state.tx_speed_changed.load(Ordering::Relaxed) {
+        if adaptive_speed && state.tx_speed_changed.load(Ordering::Relaxed) {
             state.tx_speed_changed.store(false, Ordering::Relaxed);
             let new_speed = state.tx_speed.load(Ordering::Relaxed);
-            interval = bandwidth::calc_send_interval(new_speed, tx_size as u16);
+            interval = bandwidth::calc_send_interval(new_speed, wire_size as u16);
             next_send = Instant::now();
             tracing::debug!("TX speed adjusted to {} bps ({:.2} Mbps)",
                 new_speed, new_speed as f64 / 1_000_000.0);
@@ -934,30 +1089,33 @@ async fn udp_tx_loop(
     }
 }
 
-async fn udp_rx_loop(socket: &UdpSocket, state: Arc<BandwidthState>) {
+async fn udp_rx_loop(socket: &UdpSocket, udp_header_size: usize, state: Arc<BandwidthState>) {
     let mut buf = vec![0u8; 65536];
-    let mut last_seq: Option<u32> = None;
+    // Multi-connection RouterOS uses one independent sequence per source port.
+    let mut last_seq_by_peer: HashMap<SocketAddr, u32> = HashMap::new();
 
     while state.running.load(Ordering::Relaxed) {
         // Use recv_from to accept packets from any source port
         // (multi-connection MikroTik sends from multiple ports)
         match tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, _src))) if n >= 4 => {
-                if !state.spend_budget(n as u64) {
+            Ok(Ok((n, src))) if n >= 4 => {
+                let wire_bytes = (n + udp_header_size) as u64;
+                if !state.spend_budget(wire_bytes) {
                     break;
                 }
-                state.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                state.rx_bytes.fetch_add(wire_bytes, Ordering::Relaxed);
                 state.rx_packets.fetch_add(1, Ordering::Relaxed);
 
                 let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                if let Some(last) = last_seq {
+                if let Some(last) = last_seq_by_peer.insert(src, seq) {
                     let expected = last.wrapping_add(1);
-                    if seq > expected {
-                        let lost = seq - expected;
+                    let lost = seq.wrapping_sub(expected);
+                    // Large backwards jumps are reordering or a restarted
+                    // sender, not billions of lost packets.
+                    if lost < (u32::MAX / 2) {
                         state.rx_lost_packets.fetch_add(lost as u64, Ordering::Relaxed);
                     }
                 }
-                last_seq = Some(seq);
                 state.last_udp_seq.store(seq, Ordering::Relaxed);
             }
             Ok(Ok(_)) => {}
@@ -979,7 +1137,12 @@ async fn status_report_loop(cmd: &Command, state: &BandwidthState) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
 
     loop {
-        interval.tick().await;
+        if tokio::time::timeout(Duration::from_millis(100), interval.tick()).await.is_err() {
+            if !state.running.load(Ordering::Relaxed) {
+                break;
+            }
+            continue;
+        }
         if !state.running.load(Ordering::Relaxed) {
             break;
         }
@@ -1040,9 +1203,12 @@ async fn udp_status_loop(
                     &status_buf, client_status.seq, client_status.bytes_received, client_status.cpu_load,
                 );
 
-                if client_status.bytes_received > 0 && cmd.server_tx() {
-                    let new_speed =
-                        ((client_status.bytes_received as u64 * 8 * 3) / 2) as u32;
+                if client_status.bytes_received > 0
+                    && cmd.server_tx()
+                    && cmd.remote_tx_speed == 0
+                {
+                    let new_speed = ((client_status.bytes_received as u64 * 8 * 3) / 2)
+                        .min(u32::MAX as u64) as u32;
                     state.tx_speed.store(new_speed, Ordering::Relaxed);
                     state.tx_speed_changed.store(true, Ordering::Relaxed);
                     tracing::debug!(
@@ -1074,14 +1240,10 @@ async fn udp_status_loop(
         let tx_bytes = state.tx_bytes.swap(0, Ordering::Relaxed);
         let lost = state.rx_lost_packets.swap(0, Ordering::Relaxed);
 
-        // Report bytes relevant to the active direction.
-        // When TX-only: report tx_bytes so client knows data is flowing.
-        // When RX or BOTH: report rx_bytes (how much we received from client).
-        let report_bytes = if cmd.server_tx() && !cmd.server_rx() {
-            tx_bytes
-        } else {
-            rx_bytes
-        };
+        // A status frame always reports bytes received by its sender. Reporting
+        // bytes merely queued for UDP transmit makes RouterOS display the
+        // server's memory/enqueue rate (multiple Gbps) as delivered traffic.
+        let report_bytes = rx_bytes;
         let status = StatusMessage { cpu_load: crate::cpu::get(),
             seq,
             bytes_received: report_bytes as u32,

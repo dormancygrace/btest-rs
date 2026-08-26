@@ -85,6 +85,19 @@ impl BandwidthState {
         }
     }
 
+    /// Return an unused portion of a previously reserved byte budget.
+    ///
+    /// This is used by cancellation-safe TCP writes: a task reserves the
+    /// maximum write size, then refunds bytes that were not actually written.
+    #[inline]
+    pub fn refund_budget(&self, amount: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if amount == 0 || self.byte_budget.load(Relaxed) == u64::MAX {
+            return;
+        }
+        self.byte_budget.fetch_add(amount, Relaxed);
+    }
+
     /// Set the byte budget (total bytes allowed for the entire test).
     #[cfg(feature = "pro")]
     pub fn set_budget(&self, budget: u64) {
