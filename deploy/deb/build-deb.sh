@@ -12,7 +12,6 @@ set -euo pipefail
 # Package metadata
 ###############################################################################
 PKG_NAME="btest-rs"
-PKG_VERSION="0.6.0"
 PKG_ARCH="amd64"
 PKG_MAINTAINER="Siavash Sameni <manwe@manko.yoga>"
 PKG_DESCRIPTION="MikroTik Bandwidth Test (btest) server and client with EC-SRP5 auth"
@@ -26,6 +25,12 @@ PKG_PRIORITY="optional"
 ###############################################################################
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PKG_VERSION="${PKG_VERSION:-$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | head -1)}"
+
+if [[ -z "$PKG_VERSION" ]]; then
+    echo "Error: cannot determine package version from Cargo.toml."
+    exit 1
+fi
 
 # Locate the pre-built binary
 if [[ -n "${BTEST_BIN:-}" ]]; then
