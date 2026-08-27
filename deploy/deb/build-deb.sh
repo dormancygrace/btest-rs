@@ -78,7 +78,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/btest -s
+ExecStart=/usr/bin/btest -s --listen6
 Restart=always
 RestartSec=5
 DynamicUser=yes

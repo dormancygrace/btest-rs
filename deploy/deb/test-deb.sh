@@ -53,6 +53,7 @@ docker run --rm \
         echo '--- Checking installed files ---'
         test -x /usr/bin/btest
         test -f /usr/lib/systemd/system/btest.service
+        grep -q -- '--listen6' /usr/lib/systemd/system/btest.service
         test -f /usr/share/doc/btest-rs/README.md
         test -f /usr/share/licenses/btest-rs/LICENSE
 
@@ -74,7 +75,7 @@ docker run --rm \
         echo '--- Loopback smoke test ---'
 
         # Start server in background
-        btest -s &
+        btest -s --listen6 &
         SERVER_PID=\$!
         sleep 1
 
@@ -83,6 +84,12 @@ docker run --rm \
             echo 'Loopback TCP test passed.'
         else
             echo 'Warning: loopback test returned non-zero (may be expected in container).'
+        fi
+
+        if btest -c ::1 -d 2 2>&1; then
+            echo 'IPv6 loopback TCP test passed.'
+        else
+            echo 'Warning: IPv6 loopback test returned non-zero.'
         fi
 
         # Tear down
