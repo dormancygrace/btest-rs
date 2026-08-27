@@ -25,7 +25,7 @@ PKG_PRIORITY="optional"
 ###############################################################################
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-PKG_VERSION="${PKG_VERSION:-$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | head -1)}"
+PKG_VERSION="${PKG_VERSION:-$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | head -1 | tr -d '\r')}"
 
 if [[ -z "$PKG_VERSION" ]]; then
     echo "Error: cannot determine package version from Cargo.toml."
