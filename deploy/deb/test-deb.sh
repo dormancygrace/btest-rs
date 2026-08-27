@@ -84,13 +84,15 @@ docker run --rm \
         if btest -c 127.0.0.1 -t -d 2 2>&1; then
             echo 'Loopback TCP test passed.'
         else
-            echo 'Warning: loopback test returned non-zero (may be expected in container).'
+            echo 'IPv4 loopback TCP test failed.' >&2
+            exit 1
         fi
 
         if btest -c ::1 -t -d 2 2>&1; then
             echo 'IPv6 loopback TCP test passed.'
         else
-            echo 'Warning: IPv6 loopback test returned non-zero.'
+            echo 'IPv6 loopback TCP test failed.' >&2
+            exit 1
         fi
 
         # Tear down
